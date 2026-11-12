@@ -1,5 +1,6 @@
 """Tests for agent.provider_rate_guard — cross-session rate limit persistence."""
 
+import inspect
 import json
 import os
 import time
@@ -88,6 +89,31 @@ class TestRecordAndRead:
         assert remaining > 0
         # Should be roughly 60 seconds (allow some tolerance for test execution)
         assert 55 <= remaining <= 62
+
+    def test_record_uses_latest_blocking_bucket_reset(self, tmp_path, monkeypatch):
+        """All exhausted windows must reset before another session resumes."""
+        rate_dir = tmp_path / "rate_limits"
+        monkeypatch.setattr(
+            "agent.provider_rate_guard._state_path",
+            lambda provider: os.path.join(str(rate_dir), f"{provider}.json"),
+        )
+
+        state = _make_exhausted_state(reset_requests=10.0, reset_tokens=20.0)
+        state.requests_hour.remaining = 0
+        state.requests_hour.reset_seconds = 300.0
+
+        record_provider_rate_limit("test-provider", state)
+
+        data = json.loads((rate_dir / "test-provider.json").read_text())
+        assert 295 <= data["reset_seconds"] <= 300
+        assert 295 <= data["reset_at"] - data["exhausted_at"] <= 300
+
+    def test_success_loop_does_not_clear_fresh_exhaustion(self):
+        """A 2xx response may report exhaustion for the *next* request."""
+        from agent.conversation_loop import run_conversation
+
+        source = inspect.getsource(run_conversation)
+        assert "clear_provider_rate_limit" not in source
 
 
 class TestExpiredCleanup:

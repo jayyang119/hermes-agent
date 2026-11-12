@@ -1996,13 +1996,6 @@ def run_conversation(
                         clear_nous_rate_limit()
                     except Exception:
                         pass
-                # Clear cross-session provider rate limit on success —
-                # proves the limit has reset for any provider.
-                try:
-                    from agent.provider_rate_guard import clear_provider_rate_limit
-                    clear_provider_rate_limit(agent.provider)
-                except Exception:
-                    pass
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
 

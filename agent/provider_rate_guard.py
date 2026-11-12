@@ -63,6 +63,7 @@ def record_provider_rate_limit(provider: str, state) -> None:
         state: A RateLimitState dataclass from rate_limit_tracker.
     """
     from agent.rate_limit_tracker import (
+        PREDICTIVE_RATE_LIMIT_MIN_RESET_SECONDS,
         PREDICTIVE_RATE_LIMIT_REQUEST_FLOOR,
         PREDICTIVE_RATE_LIMIT_TOKEN_FLOOR,
         should_predictively_skip,
@@ -73,8 +74,29 @@ def record_provider_rate_limit(provider: str, state) -> None:
     if not skip.should_skip:
         return
 
+    # ``should_predictively_skip`` intentionally returns the first matching
+    # bucket for a useful user-facing reason.  Persistence has a different
+    # requirement: the provider remains blocked until *every* exhausted
+    # bucket has reset.  Persist the latest blocking reset rather than the
+    # first (often minute-window) reset, otherwise another session can resume
+    # while an exhausted hourly window is still active.
+    blocking_resets = []
+    for bucket, floor in (
+        (state.requests_min, PREDICTIVE_RATE_LIMIT_REQUEST_FLOOR),
+        (state.requests_hour, PREDICTIVE_RATE_LIMIT_REQUEST_FLOOR),
+        (state.tokens_min, PREDICTIVE_RATE_LIMIT_TOKEN_FLOOR),
+        (state.tokens_hour, PREDICTIVE_RATE_LIMIT_TOKEN_FLOOR),
+    ):
+        if bucket.limit <= 0 or bucket.remaining > floor:
+            continue
+        reset_seconds = bucket.remaining_seconds_now
+        if reset_seconds > PREDICTIVE_RATE_LIMIT_MIN_RESET_SECONDS:
+            blocking_resets.append(reset_seconds)
+
+    reset_seconds = max(blocking_resets, default=skip.reset_seconds)
+
     now = time.time()
-    reset_at = now + skip.reset_seconds
+    reset_at = now + reset_seconds
 
     path = _state_path(provider)
     try:
@@ -85,7 +107,7 @@ def record_provider_rate_limit(provider: str, state) -> None:
             "provider": provider,
             "exhausted_at": now,
             "reset_at": reset_at,
-            "reset_seconds": skip.reset_seconds,
+            "reset_seconds": reset_seconds,
             "captured_at": state.captured_at,
             "remaining_requests_min": state.requests_min.remaining,
             "remaining_tokens_min": state.tokens_min.remaining,
@@ -108,7 +130,7 @@ def record_provider_rate_limit(provider: str, state) -> None:
 
         logger.info(
             "Provider %s rate limit recorded: resets in %.0fs (at %.0f) — %s",
-            provider, skip.reset_seconds, reset_at, skip.reason,
+            provider, reset_seconds, reset_at, skip.reason,
         )
     except Exception as exc:
         logger.debug("Failed to write provider rate limit state for %s: %s", provider, exc)
@@ -140,7 +162,7 @@ def provider_rate_limit_remaining(provider: str) -> Optional[float]:
 
 
 def clear_provider_rate_limit(provider: str) -> None:
-    """Clear the rate limit state for a provider (e.g., after a successful request)."""
+    """Clear persisted rate-limit state after healthy provider telemetry."""
     try:
         os.unlink(_state_path(provider))
     except FileNotFoundError:

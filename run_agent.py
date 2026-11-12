@@ -2397,12 +2397,18 @@ class AIAgent:
             if state is not None:
                 self._rate_limit_state = state
                 # Persist exhaustion to cross-session guard so subagents
-                # inherit the parent's rate-limit telemetry.
+                # inherit the parent's rate-limit telemetry. Conversely, only
+                # fresh healthy telemetry proves that a previously persisted
+                # limit has cleared; a successful response can itself report
+                # exhaustion for the next request.
                 try:
                     from agent.rate_limit_tracker import should_predictively_skip
                     if should_predictively_skip(state).should_skip:
                         from agent.provider_rate_guard import record_provider_rate_limit
                         record_provider_rate_limit(self.provider, state)
+                    else:
+                        from agent.provider_rate_guard import clear_provider_rate_limit
+                        clear_provider_rate_limit(self.provider)
                 except Exception:
                     pass
         except Exception:
