@@ -3831,6 +3831,27 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                         "Add the API endpoint URL, e.g.: base_url: https://api.example.com/v1",
                     ))
 
+    try:
+        from hermes_cli.fallback_config import _custom_provider_model_map, _custom_provider_name
+
+        custom_fallback_models = _custom_provider_model_map(config)
+    except Exception:
+        custom_fallback_models = {}
+
+    def _fallback_entry_has_resolvable_model(entry: Dict[str, Any]) -> bool:
+        raw_model = entry.get("model")
+        model = str(raw_model or "").strip()
+        if model and model.lower() != "auto":
+            return True
+        provider = str(entry.get("provider") or "").strip()
+        custom_name = _custom_provider_name(provider) if provider else ""
+        if custom_name:
+            return bool(custom_fallback_models.get(custom_name.lower()))
+        # Only custom providers may use model: auto/missing and resolve it
+        # from their custom provider definition. Non-custom providers still
+        # require a concrete model string.
+        return False
+
     # ── fallback_model: single dict OR list of dicts (chain) ─────────────
     fb = config.get("fallback_model")
     if fb is not None:
@@ -3850,11 +3871,11 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                             f"fallback_model[{i}] is missing 'provider' field",
                             "Add: provider: openrouter (or another provider)",
                         ))
-                    if not entry.get("model"):
+                    if not _fallback_entry_has_resolvable_model(entry):
                         issues.append(ConfigIssue(
                             "warning",
                             f"fallback_model[{i}] is missing 'model' field",
-                            "Add: model: <model-name>",
+                            "Add: model: <model-name> (or use provider: custom:<name> with a model/default_model in custom_providers)",
                         ))
         elif not isinstance(fb, dict):
             issues.append(ConfigIssue(
@@ -3872,11 +3893,11 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                     "fallback_model is missing 'provider' field — fallback will be disabled",
                     "Add: provider: openrouter (or another provider)",
                 ))
-            if not fb.get("model"):
+            if not _fallback_entry_has_resolvable_model(fb):
                 issues.append(ConfigIssue(
                     "warning",
                     "fallback_model is missing 'model' field — fallback will be disabled",
-                    "Add: model: anthropic/claude-sonnet-4 (or another model)",
+                    "Add: model: anthropic/claude-sonnet-4 (or use provider: custom:<name> with a model/default_model in custom_providers)",
                 ))
 
     # ── Check for fallback_model accidentally nested inside custom_providers ──

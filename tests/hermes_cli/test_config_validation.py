@@ -163,6 +163,53 @@ class TestFallbackModelValidation:
         })
         assert any("fallback_model[0]" in i.message and "model" in i.message for i in issues)
 
+    def test_custom_provider_fallback_missing_model_resolves_without_warning(self):
+        issues = validate_config_structure({
+            "custom_providers": [
+                {
+                    "name": "openrouter-cn",
+                    "base_url": "https://openrouter.example/v1",
+                    "model": "z-ai/glm-5.1",
+                },
+            ],
+            "model": {"provider": "custom:openrouter-cn", "default": "z-ai/glm-5.1"},
+            "fallback_model": [
+                {"provider": "custom:openrouter-cn"},
+            ],
+        })
+        assert not any("fallback_model[0]" in i.message and "model" in i.message for i in issues)
+
+    def test_custom_provider_fallback_auto_model_resolves_without_warning(self):
+        issues = validate_config_structure({
+            "custom_providers": [
+                {
+                    "name": "openrouter-cn",
+                    "base_url": "https://openrouter.example/v1",
+                    "model": "z-ai/glm-5.1",
+                },
+            ],
+            "model": {"provider": "custom:openrouter-cn", "default": "z-ai/glm-5.1"},
+            "fallback_model": {"provider": "custom:openrouter-cn", "model": "auto"},
+        })
+        fb_issues = [i for i in issues if "fallback_model" in i.message and "model" in i.message]
+        assert fb_issues == []
+
+    def test_non_custom_provider_fallback_auto_model_warns(self):
+        issues = validate_config_structure({
+            "fallback_model": {"provider": "openrouter", "model": "auto"},
+        })
+        assert any("fallback_model" in i.message and "model" in i.message for i in issues)
+
+    def test_custom_provider_fallback_auto_model_without_default_warns(self):
+        issues = validate_config_structure({
+            "custom_providers": [
+                {"name": "openrouter-cn", "base_url": "https://openrouter.example/v1"},
+            ],
+            "model": {"provider": "custom:openrouter-cn", "default": "z-ai/glm-5.1"},
+            "fallback_model": {"provider": "custom:openrouter-cn", "model": "auto"},
+        })
+        assert any("fallback_model" in i.message and "model" in i.message for i in issues)
+
     def test_fallback_list_entry_not_a_dict(self):
         issues = validate_config_structure({
             "fallback_model": ["openrouter:anthropic/claude-sonnet-4"],
