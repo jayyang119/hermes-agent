@@ -8,6 +8,12 @@ from agent.rate_limit_tracker import (
     parse_rate_limit_headers,
     format_rate_limit_display,
     format_rate_limit_compact,
+    PredictiveSkipDecision,
+    should_predictively_skip,
+    PREDICTIVE_RATE_LIMIT_MAX_AGE_SECONDS,
+    PREDICTIVE_RATE_LIMIT_MIN_RESET_SECONDS,
+    PREDICTIVE_RATE_LIMIT_REQUEST_FLOOR,
+    PREDICTIVE_RATE_LIMIT_TOKEN_FLOOR,
     _fmt_count,
     _fmt_seconds,
     _bar,
@@ -207,3 +213,132 @@ class TestAgentIntegration:
         # None should not crash
         result = parse_rate_limit_headers({})
         assert result is None
+
+
+class TestPredictiveSkip:
+    """Tests for should_predictively_skip()."""
+
+    def _make_state(self, **bucket_overrides) -> RateLimitState:
+        """Build a RateLimitState with sensible defaults; override buckets via kwargs."""
+        now = time.time()
+        defaults = dict(
+            requests_min=RateLimitBucket(limit=800, remaining=795, reset_seconds=45.0, captured_at=now),
+            requests_hour=RateLimitBucket(limit=33600, remaining=33590, reset_seconds=3500.0, captured_at=now),
+            tokens_min=RateLimitBucket(limit=8000000, remaining=7999500, reset_seconds=42.0, captured_at=now),
+            tokens_hour=RateLimitBucket(limit=336000000, remaining=335999000, reset_seconds=3490.0, captured_at=now),
+            captured_at=now,
+            provider="test",
+        )
+        defaults.update(bucket_overrides)
+        return RateLimitState(**defaults)
+
+    # 1. No state at all
+    def test_no_state(self):
+        result = should_predictively_skip(None)
+        assert result.should_skip is False
+        assert result.reason == ""
+        assert result.bucket_label == ""
+
+    # 2. State exists but has_data is False
+    def test_no_data(self):
+        state = RateLimitState()  # captured_at=0 => has_data=False
+        result = should_predictively_skip(state)
+        assert result.should_skip is False
+
+    # 3. Stale data (age > max_age_seconds)
+    def test_stale_data(self):
+        now = time.time()
+        state = self._make_state(captured_at=now - 200)
+        result = should_predictively_skip(state)
+        assert result.should_skip is False
+
+    # 4. requests_min exhausted
+    def test_requests_min_exhausted(self):
+        now = time.time()
+        state = self._make_state(
+            requests_min=RateLimitBucket(limit=800, remaining=0, reset_seconds=30.0, captured_at=now),
+        )
+        result = should_predictively_skip(state)
+        assert result.should_skip is True
+        assert result.bucket_label == "requests/min"
+        assert result.reset_seconds > 0
+
+    # 5. requests_min at floor (remaining == request_floor)
+    def test_requests_min_at_floor(self):
+        now = time.time()
+        state = self._make_state(
+            requests_min=RateLimitBucket(limit=800, remaining=1, reset_seconds=10.0, captured_at=now),
+        )
+        result = should_predictively_skip(state)
+        assert result.should_skip is True
+        assert result.bucket_label == "requests/min"
+
+    # 6. tokens_min exhausted
+    def test_tokens_min_exhausted(self):
+        now = time.time()
+        state = self._make_state(
+            requests_min=RateLimitBucket(limit=800, remaining=795, reset_seconds=45.0, captured_at=now),
+            tokens_min=RateLimitBucket(limit=8000000, remaining=0, reset_seconds=20.0, captured_at=now),
+        )
+        result = should_predictively_skip(state)
+        assert result.should_skip is True
+        assert result.bucket_label == "tokens/min"
+
+    # 7. tokens_min below floor
+    def test_tokens_min_below_floor(self):
+        now = time.time()
+        state = self._make_state(
+            requests_min=RateLimitBucket(limit=800, remaining=795, reset_seconds=45.0, captured_at=now),
+            tokens_min=RateLimitBucket(limit=8000000, remaining=100, reset_seconds=15.0, captured_at=now),
+        )
+        result = should_predictively_skip(state)
+        assert result.should_skip is True
+        assert result.bucket_label == "tokens/min"
+
+    # 8. requests_hour exhausted
+    def test_requests_hour_exhausted(self):
+        now = time.time()
+        state = self._make_state(
+            requests_min=RateLimitBucket(limit=800, remaining=795, reset_seconds=45.0, captured_at=now),
+            requests_hour=RateLimitBucket(limit=33600, remaining=0, reset_seconds=300.0, captured_at=now),
+        )
+        result = should_predictively_skip(state)
+        assert result.should_skip is True
+        assert result.bucket_label == "requests/hour"
+
+    # 9. Priority: requests_min takes precedence over tokens_min
+    def test_priority_order(self):
+        now = time.time()
+        state = self._make_state(
+            requests_min=RateLimitBucket(limit=800, remaining=0, reset_seconds=30.0, captured_at=now),
+            tokens_min=RateLimitBucket(limit=8000000, remaining=0, reset_seconds=20.0, captured_at=now),
+        )
+        result = should_predictively_skip(state)
+        assert result.should_skip is True
+        assert result.bucket_label == "requests/min"
+
+    # 10. Reset too short — remaining=0 but remaining_seconds_now < min_reset_seconds
+    def test_reset_too_short(self):
+        now = time.time()
+        # reset_seconds=0.5, just captured => remaining_seconds_now ≈ 0.5 < 2.0
+        state = self._make_state(
+            requests_min=RateLimitBucket(limit=800, remaining=0, reset_seconds=0.5, captured_at=now),
+        )
+        result = should_predictively_skip(state)
+        assert result.should_skip is False
+
+    # 11. All buckets have plenty of headroom
+    def test_all_buckets_ok(self):
+        state = self._make_state()
+        result = should_predictively_skip(state)
+        assert result.should_skip is False
+
+    # 12. Custom floors: request_floor=5, remaining=3 => should skip
+    def test_custom_floors(self):
+        now = time.time()
+        state = self._make_state(
+            requests_min=RateLimitBucket(limit=800, remaining=3, reset_seconds=10.0, captured_at=now),
+        )
+        result = should_predictively_skip(state, request_floor=5)
+        assert result.should_skip is True
+        assert result.bucket_label == "requests/min"

@@ -2396,6 +2396,15 @@ class AIAgent:
             state = parse_rate_limit_headers(headers, provider=self.provider)
             if state is not None:
                 self._rate_limit_state = state
+                # Persist exhaustion to cross-session guard so subagents
+                # inherit the parent's rate-limit telemetry.
+                try:
+                    from agent.rate_limit_tracker import should_predictively_skip
+                    if should_predictively_skip(state).should_skip:
+                        from agent.provider_rate_guard import record_provider_rate_limit
+                        record_provider_rate_limit(self.provider, state)
+                except Exception:
+                    pass
         except Exception:
             pass  # Never let header parsing break the agent loop
 

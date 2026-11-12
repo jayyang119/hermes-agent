@@ -27,6 +27,81 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
 
+PREDICTIVE_RATE_LIMIT_MAX_AGE_SECONDS = 120.0
+PREDICTIVE_RATE_LIMIT_MIN_RESET_SECONDS = 2.0
+PREDICTIVE_RATE_LIMIT_REQUEST_FLOOR = 1
+PREDICTIVE_RATE_LIMIT_TOKEN_FLOOR = 4096
+
+
+@dataclass
+class PredictiveSkipDecision:
+    """Result of predictive rate-limit analysis."""
+    should_skip: bool
+    reason: str = ""
+    reset_seconds: float = 0.0
+    bucket_label: str = ""
+
+
+def should_predictively_skip(
+    state: Optional[RateLimitState],
+    *,
+    max_age_seconds: float = PREDICTIVE_RATE_LIMIT_MAX_AGE_SECONDS,
+    min_reset_seconds: float = PREDICTIVE_RATE_LIMIT_MIN_RESET_SECONDS,
+    request_floor: int = PREDICTIVE_RATE_LIMIT_REQUEST_FLOOR,
+    token_floor: int = PREDICTIVE_RATE_LIMIT_TOKEN_FLOOR,
+) -> PredictiveSkipDecision:
+    """Decide whether to skip a provider based on captured rate-limit state.
+
+    Returns a PredictiveSkipDecision indicating whether the provider should
+    be predictively skipped before the next API call is made.
+
+    Logic:
+    1. If state is None or has no data, don't skip (no info to act on).
+    2. If state is stale (age > max_age_seconds), don't skip.
+    3. Check buckets in priority order: requests_min, requests_hour,
+       tokens_min, tokens_hour.
+    4. For each bucket with limit > 0, skip if:
+       - remaining <= floor AND remaining_seconds_now > min_reset_seconds, OR
+       - remaining == 0 AND remaining_seconds_now > min_reset_seconds
+    5. Return the first match (most urgent bucket wins).
+    6. If no bucket triggers, don't skip.
+    """
+    # 1. No data — nothing to act on
+    if state is None or not state.has_data:
+        return PredictiveSkipDecision(should_skip=False)
+
+    # 2. Stale data — don't trust old telemetry
+    if state.age_seconds > max_age_seconds:
+        return PredictiveSkipDecision(should_skip=False)
+
+    # 3-5. Check buckets in priority order
+    bucket_checks = [
+        ("requests/min", state.requests_min, request_floor),
+        ("requests/hour", state.requests_hour, request_floor),
+        ("tokens/min", state.tokens_min, token_floor),
+        ("tokens/hour", state.tokens_hour, token_floor),
+    ]
+
+    for label, bucket, floor in bucket_checks:
+        if bucket.limit <= 0:
+            continue
+        secs = bucket.remaining_seconds_now
+        if (bucket.remaining <= floor or bucket.remaining == 0) and secs > min_reset_seconds:
+            reason = (
+                f"{label} exhausted: {bucket.remaining}/{bucket.limit} remaining, "
+                f"resets in {secs:.0f}s"
+            )
+            return PredictiveSkipDecision(
+                should_skip=True,
+                reason=reason,
+                reset_seconds=secs,
+                bucket_label=label,
+            )
+
+    # 6. No bucket triggers
+    return PredictiveSkipDecision(should_skip=False)
+
+
 @dataclass
 class RateLimitBucket:
     """One rate-limit window (e.g. requests per minute)."""

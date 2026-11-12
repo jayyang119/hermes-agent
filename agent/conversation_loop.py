@@ -1203,6 +1203,54 @@ def run_conversation(
                 except Exception:
                     pass  # Never let rate guard break the agent loop
 
+            # ── Generic predictive rate-limit guard ───────────────
+            # If the last response from this provider captured
+            # x-ratelimit-* headers showing exhaustion, skip the API
+            # call and try fallback instead of burning a 429.
+            if not getattr(agent, "_fallback_activated", False):
+                try:
+                    # Cross-session check: another session may have recorded
+                    # exhaustion for this provider.  Check before in-memory state
+                    # so subagents inherit the parent's telemetry.
+                    from agent.provider_rate_guard import provider_rate_limit_remaining
+                    _cross_remaining = provider_rate_limit_remaining(agent.provider)
+                    if _cross_remaining is not None and _cross_remaining > 0:
+                        _pred_msg = (
+                            f"Predictive rate-limit: {agent.provider} exhausted "
+                            f"(cross-session) — resets in {int(_cross_remaining)}s."
+                        )
+                        agent._buffer_vprint(f"⏳ {_pred_msg} Trying fallback...")
+                        agent._buffer_status(f"⏳ {_pred_msg}")
+                        if agent._try_activate_fallback():
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            continue
+                except Exception:
+                    pass  # Never let cross-session guard break the agent loop
+                try:
+                    _rl_state = agent.get_rate_limit_state()
+                    if _rl_state is not None and _rl_state.provider == agent.provider:
+                        from agent.rate_limit_tracker import should_predictively_skip
+                        _skip = should_predictively_skip(_rl_state)
+                        if _skip.should_skip:
+                            _pred_msg = (
+                                f"Predictive rate-limit: {_skip.bucket_label} "
+                                f"exhausted on {agent.provider} — "
+                                f"resets in {int(_skip.reset_seconds)}s."
+                            )
+                            agent._buffer_vprint(f"⏳ {_pred_msg} Trying fallback...")
+                            agent._buffer_status(f"⏳ {_pred_msg}")
+                            if agent._try_activate_fallback():
+                                retry_count = 0
+                                compression_attempts = 0
+                                primary_recovery_attempted = False
+                                continue
+                            # No fallback — let the request proceed anyway
+                            # (better to try and get a real error than give up)
+                except Exception:
+                    pass  # Never let predictive guard break the agent loop
+
             try:
                 agent._reset_stream_delivery_tracking()
                 # api_messages is built once, before this retry loop, while the
@@ -1948,6 +1996,13 @@ def run_conversation(
                         clear_nous_rate_limit()
                     except Exception:
                         pass
+                # Clear cross-session provider rate limit on success —
+                # proves the limit has reset for any provider.
+                try:
+                    from agent.provider_rate_guard import clear_provider_rate_limit
+                    clear_provider_rate_limit(agent.provider)
+                except Exception:
+                    pass
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
 
