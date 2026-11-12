@@ -888,6 +888,9 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Per-call reasoning effort override. When set, overrides the
+    # delegation.reasoning_effort config value for this child.
+    reasoning_effort: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1057,24 +1060,37 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: per-call override > delegation config > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
-    try:
-        delegation_effort = str(delegation_cfg.get("reasoning_effort") or "").strip()
-        if delegation_effort:
-            from hermes_constants import parse_reasoning_effort
+    # Per-call reasoning_effort parameter takes highest priority
+    if reasoning_effort:
+        from hermes_constants import parse_reasoning_effort
 
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is not None:
-                child_reasoning = parsed
-            else:
-                logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
-                )
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+        parsed = parse_reasoning_effort(reasoning_effort)
+        if parsed is not None:
+            child_reasoning = parsed
+        else:
+            logger.warning(
+                "Unknown reasoning_effort '%s', falling back to config/parent level",
+                reasoning_effort,
+            )
+    else:
+        try:
+            delegation_effort = str(delegation_cfg.get("reasoning_effort") or "").strip()
+            if delegation_effort:
+                from hermes_constants import parse_reasoning_effort
+
+                parsed = parse_reasoning_effort(delegation_effort)
+                if parsed is not None:
+                    child_reasoning = parsed
+                else:
+                    logger.warning(
+                        "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                        delegation_effort,
+                    )
+        except Exception as exc:
+            logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
@@ -1924,6 +1940,9 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -1992,6 +2011,14 @@ def delegate_task(
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
+    # Tool-parameter model/provider augment the config so they go through the
+    # same credential resolution path (base_url, api_key, api_mode).
+    if provider or model:
+        cfg = dict(cfg)  # shallow copy so we don't mutate the cached config
+        if provider:
+            cfg["provider"] = provider
+        if model:
+            cfg["model"] = model
     try:
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
@@ -2058,19 +2085,51 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Per-task model/provider/reasoning_effort beat top-level,
+            # which beat config-derived creds. This lets the model route
+            # individual tasks to different providers (e.g. cheap model for
+            # research, parent model for code) while still honouring
+            # delegation.provider/model config as the baseline.
+            task_model = t.get("model") or model or creds["model"]
+            task_provider_raw = t.get("provider") or provider
+            task_provider = task_provider_raw or creds["provider"]
+            task_reasoning = t.get("reasoning_effort") or reasoning_effort
+            # When per-task provider differs from the resolved top-level
+            # provider, resolve its credentials separately so base_url,
+            # api_key, and api_mode are correct for that provider.
+            if task_provider_raw and task_provider_raw != creds.get("provider"):
+                task_cfg = dict(cfg)
+                task_cfg["provider"] = task_provider_raw
+                # Keep the effective inherited/configured model when only the
+                # provider is overridden. Some provider resolvers use the
+                # target model while selecting a route; replacing the config
+                # model with None here made credential resolution inconsistent
+                # with the model ultimately passed to the child.
+                task_cfg["model"] = task_model
+                try:
+                    task_creds = _resolve_delegation_credentials(task_cfg, parent_agent)
+                except ValueError as exc:
+                    return tool_error(f"Task {i} provider error: {exc}")
+                task_base_url = task_creds["base_url"]
+                task_api_key = task_creds["api_key"]
+                task_api_mode = task_creds["api_mode"]
+            else:
+                task_base_url = creds["base_url"]
+                task_api_key = creds["api_key"]
+                task_api_mode = creds["api_mode"]
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                model=task_model,
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
+                override_provider=task_provider,
+                override_base_url=task_base_url,
+                override_api_key=task_api_key,
+                override_api_mode=task_api_mode,
                 override_acp_command=t.get("acp_command")
                 or acp_command
                 or creds.get("command"),
@@ -2080,6 +2139,7 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+                reasoning_effort=task_reasoning,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2736,6 +2796,19 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "model": {
+                            "type": "string",
+                            "description": "Per-task model override. Overrides top-level model for this task only.",
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": "Per-task provider override. Overrides top-level provider for this task only.",
+                        },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high"],
+                            "description": "Per-task reasoning effort override.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -2771,6 +2844,30 @@ DELEGATE_TASK_SCHEMA = {
                     "Leave empty unless acp_command is explicitly provided."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Model override for child agents (e.g. 'gpt-5.5', 'openrouter/auto'). "
+                    "When set, all subagents use this model instead of inheriting the parent's model. "
+                    "Use 'openrouter/auto' for cheaper research tasks, or the parent's model for coding tasks."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Provider override for child agents (e.g. 'openai-codex', 'custom:openrouter-cn'). "
+                    "When set, subagents route to this provider instead of inheriting the parent's. "
+                    "Use 'custom:openrouter-cn' when OpenAI is rate-limited, since it has independent quota."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "description": (
+                    "Reasoning effort for child agents. 'low' for simple lookup/read-only tasks, "
+                    "'medium' for most tasks (default), 'high' for difficult reasoning or complex debugging."
+                ),
+            },
         },
         "required": [],
     },
@@ -2793,6 +2890,9 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        model=args.get("model"),
+        provider=args.get("provider"),
+        reasoning_effort=args.get("reasoning_effort"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

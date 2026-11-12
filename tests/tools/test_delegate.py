@@ -1333,6 +1333,69 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_batch_tasks_resolve_independent_provider_routes(
+        self, mock_creds, mock_cfg
+    ):
+        """Per-task providers get their own credentials and effective model."""
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "baseline-model",
+            "provider": "baseline-provider",
+        }
+
+        def resolve(cfg, parent):
+            provider = cfg.get("provider")
+            return {
+                "model": cfg.get("model"),
+                "provider": provider,
+                "base_url": f"https://{provider}.example/v1",
+                "api_key": f"key-{provider}",
+                "api_mode": "chat_completions",
+            }
+
+        mock_creds.side_effect = resolve
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = {
+                "task_index": 0, "status": "completed",
+                "summary": "Done", "api_calls": 1, "duration_seconds": 1.0,
+            }
+            delegate_task(
+                tasks=[
+                    {"goal": "A", "provider": "route-a"},
+                    {"goal": "B", "provider": "route-b", "model": "model-b"},
+                ],
+                parent_agent=parent,
+            )
+
+        routes = {
+            call.kwargs["override_provider"]: (
+                call.kwargs["model"],
+                call.kwargs["override_base_url"],
+                call.kwargs["override_api_key"],
+            )
+            for call in mock_build.call_args_list
+        }
+        self.assertEqual(
+            routes,
+            {
+                "route-a": (
+                    "baseline-model", "https://route-a.example/v1", "key-route-a"
+                ),
+                "route-b": ("model-b", "https://route-b.example/v1", "key-route-b"),
+            },
+        )
+        resolved_task_cfgs = [call.args[0] for call in mock_creds.call_args_list[1:]]
+        self.assertEqual(
+            {(cfg["provider"], cfg["model"]) for cfg in resolved_task_cfgs},
+            {("route-a", "baseline-model"), ("route-b", "model-b")},
+        )
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_delegation_acp_runtime_reaches_child_agent(self, mock_creds, mock_cfg):
         """Resolved ACP runtime command/args must be forwarded to child agents."""
         mock_cfg.return_value = {
@@ -1760,21 +1823,32 @@ class TestDelegateHeartbeat(unittest.TestCase):
             "last_activity_desc": "executing tool: terminal",
         }
 
+        enough_heartbeats = threading.Event()
+
+        def touch(desc):
+            touch_calls.append(desc)
+            if len(touch_calls) >= 4:
+                enough_heartbeats.set()
+
+        parent._touch_activity = touch
+
         def slow_run(**kwargs):
-            # Long enough to exceed the OLD idle threshold (5 cycles) at
-            # the patched interval, but shorter than the new in-tool
-            # threshold.
-            time.sleep(0.4)
+            # Synchronize on heartbeat count rather than wall-clock sleep.
+            # Busy CI hosts can oversleep a nominal 0.4s by hundreds of
+            # milliseconds, making a raw cadence assertion flaky even when
+            # the in-tool branch is correct.
+            enough_heartbeats.wait(timeout=1.0)
             return {"final_response": "done", "completed": True, "api_calls": 1}
 
         child.run_conversation.side_effect = slow_run
 
-        # Patch both the interval AND the idle ceiling so the test proves
-        # the in-tool branch takes effect: with a 0.05s interval and the
-        # default _HEARTBEAT_STALE_CYCLES_IDLE=5, the old behavior would
-        # trip after 0.25s and stop firing. We should see heartbeats
-        # continuing through the full 0.4s run.
-        with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05):
+        # Make the distinction deterministic: the idle branch would stop
+        # before four touches, while the in-tool branch allows them.
+        with (
+            patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.01),
+            patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IDLE", 2),
+            patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IN_TOOL", 8),
+        ):
             _run_single_child(
                 task_index=0,
                 goal="Test long-running tool",
@@ -1782,14 +1856,12 @@ class TestDelegateHeartbeat(unittest.TestCase):
                 parent_agent=parent,
             )
 
-        # With the old idle threshold (5 cycles = 0.25s), touch_calls
-        # would cap at ~5. With the in-tool threshold (20 cycles = 1.0s),
-        # we should see substantially more heartbeats over 0.4s.
-        self.assertGreater(
-            len(touch_calls), 6,
-            f"Heartbeat stopped too early while child was inside a tool; "
-            f"got {len(touch_calls)} touches over 0.4s at 0.05s interval",
+        self.assertTrue(
+            enough_heartbeats.is_set(),
+            f"Heartbeat stopped at the idle threshold while child was inside "
+            f"a tool; got {len(touch_calls)} touches",
         )
+        self.assertGreaterEqual(len(touch_calls), 4)
 
 
 
@@ -1871,6 +1943,34 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
+
+    def test_agent_loop_forwards_routing_overrides(self):
+        """Model-emitted delegate_task routing fields must reach the tool."""
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        args = {
+            "goal": "route me",
+            "context": "ctx",
+            "toolsets": ["terminal", "file"],
+            "tasks": [{"goal": "child", "provider": "custom:openrouter-cn"}],
+            "max_iterations": 17,
+            "acp_command": "claude",
+            "acp_args": ["--acp", "--stdio"],
+            "role": "orchestrator",
+            "model": "openrouter/auto",
+            "provider": "custom:openrouter-cn",
+            "reasoning_effort": "high",
+        }
+
+        with patch("tools.delegate_tool.delegate_task", return_value='{"ok": true}') as mock_delegate:
+            result = agent._dispatch_delegate_task(args)
+
+        self.assertEqual(result, '{"ok": true}')
+        _, kwargs = mock_delegate.call_args
+        self.assertIs(kwargs["parent_agent"], agent)
+        for key, value in args.items():
+            self.assertEqual(kwargs[key], value)
 
     @patch("tools.delegate_tool._load_config", return_value={})
     @patch("tools.delegate_tool._resolve_delegation_credentials")
