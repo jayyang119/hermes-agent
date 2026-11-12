@@ -1341,12 +1341,20 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             "max_iterations": 45,
             "model": "baseline-model",
             "provider": "baseline-provider",
+            "base_url": "https://baseline.example/v1",
+            "api_key": "baseline-key",
+            "api_mode": "anthropic_messages",
         }
 
         def resolve(cfg, parent):
             provider = cfg.get("provider")
+            default_models = {
+                "baseline-provider": "baseline-model",
+                "route-a": "route-a-default-model",
+                "route-b": "route-b-default-model",
+            }
             return {
-                "model": cfg.get("model"),
+                "model": cfg.get("model") or default_models[provider],
                 "provider": provider,
                 "base_url": f"https://{provider}.example/v1",
                 "api_key": f"key-{provider}",
@@ -1383,16 +1391,19 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             routes,
             {
                 "route-a": (
-                    "baseline-model", "https://route-a.example/v1", "key-route-a"
+                    "route-a-default-model", "https://route-a.example/v1", "key-route-a"
                 ),
                 "route-b": ("model-b", "https://route-b.example/v1", "key-route-b"),
             },
         )
         resolved_task_cfgs = [call.args[0] for call in mock_creds.call_args_list[1:]]
-        self.assertEqual(
-            {(cfg["provider"], cfg["model"]) for cfg in resolved_task_cfgs},
-            {("route-a", "baseline-model"), ("route-b", "model-b")},
-        )
+        route_cfgs = {cfg["provider"]: cfg for cfg in resolved_task_cfgs}
+        self.assertNotIn("model", route_cfgs["route-a"])
+        self.assertEqual(route_cfgs["route-b"]["model"], "model-b")
+        for cfg in route_cfgs.values():
+            self.assertNotIn("base_url", cfg)
+            self.assertNotIn("api_key", cfg)
+            self.assertNotIn("api_mode", cfg)
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")

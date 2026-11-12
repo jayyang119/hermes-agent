@@ -2090,7 +2090,8 @@ def delegate_task(
             # individual tasks to different providers (e.g. cheap model for
             # research, parent model for code) while still honouring
             # delegation.provider/model config as the baseline.
-            task_model = t.get("model") or model or creds["model"]
+            task_model_override = t.get("model") or model
+            task_model = task_model_override or creds["model"]
             task_provider_raw = t.get("provider") or provider
             task_provider = task_provider_raw or creds["provider"]
             task_reasoning = t.get("reasoning_effort") or reasoning_effort
@@ -2100,23 +2101,33 @@ def delegate_task(
             if task_provider_raw and task_provider_raw != creds.get("provider"):
                 task_cfg = dict(cfg)
                 task_cfg["provider"] = task_provider_raw
-                # Keep the effective inherited/configured model when only the
-                # provider is overridden. Some provider resolvers use the
-                # target model while selecting a route; replacing the config
-                # model with None here made credential resolution inconsistent
-                # with the model ultimately passed to the child.
-                task_cfg["model"] = task_model
+                # A provider override must not retain endpoint credentials from
+                # delegation config: those belong to the baseline route and
+                # would cause _resolve_delegation_credentials() to bypass the
+                # requested provider entirely.  Likewise, when no model is
+                # explicitly supplied for this call/task, let the target
+                # provider resolver select its own default model instead of
+                # carrying the baseline provider's configured model across.
+                for route_key in ("base_url", "api_key", "api_mode"):
+                    task_cfg.pop(route_key, None)
+                if task_model_override:
+                    task_cfg["model"] = task_model_override
+                else:
+                    task_cfg.pop("model", None)
                 try:
                     task_creds = _resolve_delegation_credentials(task_cfg, parent_agent)
                 except ValueError as exc:
                     return tool_error(f"Task {i} provider error: {exc}")
+                task_model = task_model_override or task_creds["model"]
                 task_base_url = task_creds["base_url"]
                 task_api_key = task_creds["api_key"]
                 task_api_mode = task_creds["api_mode"]
+                task_route_creds = task_creds
             else:
                 task_base_url = creds["base_url"]
                 task_api_key = creds["api_key"]
                 task_api_mode = creds["api_mode"]
+                task_route_creds = creds
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2132,11 +2143,11 @@ def delegate_task(
                 override_api_mode=task_api_mode,
                 override_acp_command=t.get("acp_command")
                 or acp_command
-                or creds.get("command"),
+                or task_route_creds.get("command"),
                 override_acp_args=(
                     task_acp_args
                     if task_acp_args is not None
-                    else (acp_args if acp_args is not None else creds.get("args"))
+                    else (acp_args if acp_args is not None else task_route_creds.get("args"))
                 ),
                 role=effective_role,
                 reasoning_effort=task_reasoning,
